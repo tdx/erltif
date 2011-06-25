@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% File    : etf_broker.erl
 %%% Author  : Zsolt Keszthelyi <zsolt.erl@gmail.com>
-%%% Description : handles registering telnet servers and connects them 
+%%% Description : handles registering telnet servers and connects them
 %%%           to your app.
 %%%
 %%% Created : 14 Jun 2011 by Zsolt Keszthelyi <zsolt.erl@gmail.com>
@@ -11,6 +11,8 @@
 -behaviour(gen_server).
 
 -define(MAX_CONNECTIONS, 5).
+
+-record(st, {max_conn=?MAX_CONNECTIONS, command_h=this, servers=dict:new()}).
 
 %% API
 -export([start_link/0]).
@@ -42,7 +44,15 @@ start_link() ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([]) ->
-    {ok, dict:new()}.
+    CmdH = case application:get_env(command_h) of
+          {ok,Mod} when is_atom(Mod) -> Mod;
+          _                          -> this
+    end,
+    MaxConn = case application:get_env(max_connections) of
+            {ok,N} when is_integer(N), N > 0 -> N;
+            _                                -> ?MAX_CONNECTIONS
+    end,
+    {ok, #st{max_conn=MaxConn, command_h=CmdH}}.
 
 %%--------------------------------------------------------------------
 %% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
@@ -54,38 +64,43 @@ init([]) ->
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
 
-handle_call({add_server, Name, Port}, _From, Servers)->
-    TelnetServerPid=ce_telnet:start(connector, connection_opened, Port, ?MAX_CONNECTIONS),
+handle_call({add_server, Name, Port}, _From, State)->
+    #st{servers=Servers, max_conn=MaxConn}=State,
+    TelnetServerPid=ce_telnet:start(connector, connection_opened, Port, MaxConn),
     %% unlink it so that etf_broker won't die when a telnet server exits
     unlink(TelnetServerPid),
     NewServer=dict:from_list( [{Name, TelnetServerPid},
 			       {TelnetServerPid, Name},
-			       {{TelnetServerPid, port}, Port}, 
-			       {{TelnetServerPid, clients}, []}, 
+			       {{TelnetServerPid, port}, Port},
+			       {{TelnetServerPid, clients}, []},
 			       {{TelnetServerPid, commands}, []}] ),
 
-    
+
     %% adding new server to existing servers (if one exists with this name already it will keep it)
     NewServers=dict:merge(fun(_K, V1, _V2)->V1 end, Servers, NewServer),
 
     io:format("Added server [~p] on port ~p~n", [Name, Port]),
     io:format("Servers:~p~n", [dict:to_list(NewServers)]),
 
-    {reply, ok, NewServers};
+    {reply, ok, State#st{servers=NewServers}};
 
-handle_call({remove_server, Name}, _From, Servers)->
+handle_call({remove_server, Name}, _From, State)->
+    #st{servers=Servers}=State,
+
     TelnetServerPid=dict:fetch(Name, Servers),
     stop_server_and_clients(TelnetServerPid, Servers),
 
     %% delete all records belonging to this server
     NewServers=remove_server(TelnetServerPid, Servers),
-    
+
     io:format("Removed server [~p]~n", [Name]),
     io:format("Servers:~p~n", [dict:to_list(NewServers)]),
 
-    {reply, ok, NewServers};
+    {reply, ok, State#st{servers=NewServers}};
 
-handle_call({connected, TelnetClientPid, TelnetServerPid}, _From, Servers)->
+handle_call({connected, TelnetClientPid, TelnetServerPid}, _From, State)->
+    #st{servers=Servers} = State,
+
     Name=dict:fetch(TelnetServerPid, Servers),
 
     NewServers=dict:append({TelnetServerPid, clients}, TelnetClientPid, Servers),
@@ -93,55 +108,65 @@ handle_call({connected, TelnetClientPid, TelnetServerPid}, _From, Servers)->
     ce_telnet:send(TelnetClientPid, ">>> Type 'exit' to disconnect\n>>> Type 'help' for list of commands\n\n"),
 
     io:format("Connections to ~p: ~p~n", [Name, dict:fetch({TelnetServerPid, clients}, NewServers)]),
-    {reply, ok, NewServers};
-    
-handle_call({client_command, Line, TelnetClientPid, TelnetServerPid}, _From, Servers) ->
+    {reply, ok, State#st{servers=NewServers}};
+
+handle_call({client_command, Line, TelnetClientPid, TelnetServerPid}, _From, State) ->
+    #st{servers=Servers} = State,
+
     [CommandStr|Args]=string:tokens(Line, " "),
     Command=list_to_atom(CommandStr),
     NewServers=
-	case Command of 
+	case Command of
 	    exit ->
 		exit(TelnetClientPid, kill),
-		NS=dict:update({TelnetServerPid, clients}, 
+		NS=dict:update({TelnetServerPid, clients},
 			       fun(CurrentClients)-> CurrentClients--[TelnetClientPid] end,
 			       Servers),
 		Name=dict:fetch(TelnetServerPid, Servers),
 		io:format("Connections to ~p: ~p~n", [Name, dict:fetch({TelnetServerPid, clients}, NS)]),
 		NS;
 	    help ->
-		show_help(TelnetClientPid, TelnetServerPid, Servers),
+		show_help(State#st.command_h, TelnetClientPid, TelnetServerPid, Servers),
 		Servers;
 	    _Other ->
-		process_command(Command, Args, TelnetClientPid, TelnetServerPid, Servers),
-		Servers	    
+		process_command(State#st.command_h, Command, Args, TelnetClientPid, TelnetServerPid, Servers),
+		Servers
 	end,
-    {reply, ok, NewServers};
+    {reply, ok, State#st{servers=NewServers}};
 
-handle_call({client_closed, TelnetClientPid, TelnetServerPid}, _From, Servers) ->
-    NewServers=dict:update({TelnetServerPid, clients}, 
+handle_call({client_closed, TelnetClientPid, TelnetServerPid}, _From, State) ->
+    #st{servers=Servers} = State,
+
+    NewServers=dict:update({TelnetServerPid, clients},
 			   fun(CurrentClients)-> CurrentClients--[TelnetClientPid] end,
 			   Servers),
     Name=dict:fetch(TelnetServerPid, Servers),
     io:format("Connections to ~p: ~p~n", [Name, dict:fetch({TelnetServerPid, clients}, NewServers)]),
-    {reply, ok, NewServers};
+    {reply, ok, State#st{servers=NewServers}};
 
-handle_call({add_command, ServerName, Command, Desc, Module, Fun, Arity}, _From, Servers)->
+handle_call({add_command, ServerName, Command, Desc, Module, Fun, Arity}, _From, State)->
+    #st{servers=Servers} = State,
+
     TelnetServerPid=dict:fetch(ServerName, Servers),
     NewServers=dict:append({TelnetServerPid, commands}, {Command, Desc, Module, Fun, Arity}, Servers),
     io:format("Added command [~p] to server [~p]~n", [Command, ServerName]),
-    {reply, ok, NewServers};
+    {reply, ok, State#st{servers=NewServers}};
 
-handle_call({remove_command, ServerName, Command}, _From, Servers)->
+handle_call({remove_command, ServerName, Command}, _From, State)->
+    #st{servers=Servers} = State,
+
     TelnetServerPid=dict:fetch(ServerName, Servers),
-    NewServers=dict:update({TelnetServerPid, commands}, 
+    NewServers=dict:update({TelnetServerPid, commands},
 			   fun(CurrentCommands)-> lists:keydelete(Command, 1, CurrentCommands) end,
 			   Servers),
     io:format("Removed command [~p] from server [~p]~n", [Command, ServerName]),
-    {reply, ok, NewServers};
+    {reply, ok, State#st{servers=NewServers}};
 
-handle_call(get_servers, _From, Servers) ->
+handle_call(get_servers, _From, State) ->
+    #st{servers=Servers} = State,
+
     Reply = dict:to_list(Servers),
-    {reply, Reply, Servers};
+    {reply, Reply, State};
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -174,7 +199,7 @@ handle_cast(_Msg, State) ->
 %% 	    NewServers=remove_server(TelnetServerPid, Servers),
 %% 	    {noreply, NewServers}
 %%     end;
-	    
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -200,7 +225,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 
 
-process_command(Command, Args, TelnetClientPid, TelnetServerPid, Servers) ->
+process_command(this, Command, Args, TelnetClientPid, TelnetServerPid, Servers) ->
     ServerCommands=dict:fetch({TelnetServerPid, commands}, Servers),
     CommandStr=atom_to_list(Command),
     case lists:keyfind(Command, 1, ServerCommands) of
@@ -208,7 +233,7 @@ process_command(Command, Args, TelnetClientPid, TelnetServerPid, Servers) ->
 	    ce_telnet:send(TelnetClientPid, ">>> Unknown command: "++CommandStr++"\n");
 	{Command, _Desc, Module, Fun, Arity}->
 	    case length(Args) of
-		Arity -> 
+		Arity ->
 		    Result=apply(Module, Fun, Args),
 		    ResultStr=io_lib:format("~p", [Result]),
 		    ResultPretty=prettypr:format( prettypr:text_par(ResultStr), 50 )++"\n\n",
@@ -219,10 +244,13 @@ process_command(Command, Args, TelnetClientPid, TelnetServerPid, Servers) ->
 								 CommandStr, "]: ", Arity, "\n"
 								 ]))
 	    end
-    end.
+    end;
+process_command(Mod, Command, Args, TelnetClientPid, TelnetServerPid, Servers) ->
+    catch Mod:process_command(Command, Args, TelnetClientPid, TelnetServerPid,
+                              Servers).
 
 
-show_help(TelnetClientPid, TelnetServerPid, Servers) ->
+show_help(this, TelnetClientPid, TelnetServerPid, Servers) ->
     Commands=dict:fetch({TelnetServerPid, commands}, Servers),
     CommandInfos=
 	lists:map(fun({Command, Desc, Module, Fun, Arity})->
@@ -235,7 +263,9 @@ show_help(TelnetClientPid, TelnetServerPid, Servers) ->
 		  Commands),
     Info=lists:concat(CommandInfos),
     ce_telnet:send(TelnetClientPid, "----COMMANDS"++string:chars($-, 70, "\n")),
-    ce_telnet:send(TelnetClientPid, Info).
+    ce_telnet:send(TelnetClientPid, Info);
+show_help(Mod, TelnetClientPid, TelnetServerPid, Servers) ->
+    catch Mod:show_help(TelnetClientPid, TelnetServerPid, Servers).
 
 remove_server(TelnetServerPid, Servers)->
     Name=dict:fetch(TelnetServerPid, Servers),
@@ -253,4 +283,4 @@ stop_server_and_clients(TelnetServerPid, Servers)->
     Clients=dict:fetch({TelnetServerPid, clients}, Servers),
     [exit(Pid, stop) || Pid <- Clients],
     ce_telnet:stop(TelnetServerPid).
-							 
+
